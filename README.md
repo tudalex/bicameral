@@ -1,66 +1,71 @@
 # bicameral
 
-Run Claude Code with two minds: Claude does the thinking, and a local model
-does the mechanical work.
+**Frontier models do the logic. Open workers implement it.**
 
-The name comes from Julian Jaynes's theory of the *bicameral mind*, in which
-one half of the brain issues instructions and the other carries them out.
-Here, Claude gives the instructions and the local model follows them.
+bicameral runs Claude Code with two kinds of models working together:
 
-bicameral is a small HTTP proxy that sits between Claude Code and the API. It
-sends requests for opted-in subagents (any model starting with `claude-local`)
-to a local Anthropic-compatible engine. Everything else goes to the cloud
-unchanged. It ships with a Claude Code plugin that adds a `local-worker`
-subagent and a `delegate-local` skill, which teaches Claude when to hand work
-to that subagent and how to brief it.
+- **Claude** (the frontier model) reads the code, works out what to change,
+  and checks the result.
+- **An open model on your machine** (the worker) makes the edits, runs the
+  tests and does the busywork.
+
+The worker's tokens are free, and the files it reads stay on your machine.
+Claude sees only the brief it writes and the worker's report.
+
+The name comes from Julian Jaynes's *bicameral mind*: one half of the brain
+gives instructions, the other carries them out.
+
+## How it works
 
 ```
-claude ──► bicameral ──┬─ model=claude-local* ──► local engine (e.g. Splash)
-                       └─ everything else ──────► api.anthropic.com
+claude ──► bicameral ──┬─ worker requests ──► open model on your machine
+                       └─ everything else ──► Claude (api.anthropic.com)
 ```
 
-Local requests have their `model` rewritten to `BICAMERAL_LOCAL_MODEL`, and
-the proxy strips `Authorization`, `X-Api-Key` and `Cookie` before they leave,
-so your Anthropic credentials never reach the local engine.
+1. `bicameral` starts a small proxy and launches `claude` behind it.
+2. It adds a **`local-worker`** subagent and a **`delegate-local`** skill to
+   the session. The skill tells Claude which jobs to hand to the worker and
+   how to brief it.
+3. When Claude delegates, the proxy sends the worker's requests to your local
+   model instead of the cloud. It strips your Anthropic credentials from
+   those requests first.
+4. When you quit Claude, the proxy stops too.
 
-## Requirements
+You don't need to change your projects or your Claude Code settings.
 
-- **Go 1.27 or newer**, to build it (`go version` to check).
-- **[Claude Code](https://claude.com/claude-code)**, with `claude` on your
-  `PATH` and already logged in. bicameral launches it; it doesn't install it.
-- **At least one local model server that speaks the Anthropic Messages API**
-  (`POST /v1/messages` and `GET /v1/models`). bicameral finds these on their
-  default ports:
+## What you need
 
-  | Engine    | Address                  |
+- **[Claude Code](https://claude.com/claude-code)**, installed and logged in.
+- **A local model server that speaks the Anthropic API** (`/v1/messages`).
+  bicameral finds these by itself:
+
+  | Engine    | Default address          |
   |-----------|--------------------------|
   | Splash    | `http://127.0.0.1:8010`  |
   | Ollama    | `http://127.0.0.1:11434` |
   | LM Studio | `http://127.0.0.1:1234`  |
 
-  Any other Anthropic-compatible server works too if you set
-  `BICAMERAL_LOCAL_URL` (see [Configuration](#configuration)). An
-  OpenAI-only server (`/v1/chat/completions`) won't work.
+  Other servers work too if you set `BICAMERAL_LOCAL_URL`. Servers that only
+  speak the OpenAI API (`/v1/chat/completions`) won't work.
 
-## Installation
+Pick a model that is good at tool use and coding. A small model will make
+more mistakes; Claude checks the worker's results either way.
 
-### Prebuilt binaries
-
-Tagged versions are published on the
-[releases page](https://github.com/tudalex/bicameral/releases) for macOS and
-Linux (amd64 and arm64). To install the latest one:
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tudalex/bicameral/master/install.sh | sh
 ```
 
-The script detects your OS and CPU, downloads the matching tarball, checks it
-against the release's `checksums.txt`, and installs `bicameral` to
-`~/.local/bin`. Set `BICAMERAL_VERSION=v0.1.0` to install a specific release,
-or `BICAMERAL_INSTALL_DIR` to install somewhere else. After that, skip steps
-1–2 and go to step 3.
+This installs the right binary for your OS and CPU (macOS or Linux, amd64 or
+arm64) to `~/.local/bin`, after checking its checksum. Set
+`BICAMERAL_VERSION=v0.1.0` to pin a version, or `BICAMERAL_INSTALL_DIR` to
+install somewhere else.
 
-To install by hand instead:
+<details>
+<summary>Other ways to install</summary>
+
+**By hand**, from the [releases page](https://github.com/tudalex/bicameral/releases):
 
 ```sh
 # pick darwin_arm64, darwin_amd64, linux_amd64 or linux_arm64
@@ -68,209 +73,143 @@ curl -L https://github.com/tudalex/bicameral/releases/latest/download/bicameral_
 mv bicameral_darwin_arm64/bicameral ~/.local/bin/
 ```
 
-The macOS binaries aren't signed. If macOS blocks a binary you downloaded
-with a browser, run `xattr -d com.apple.quarantine ~/.local/bin/bicameral`.
-Downloads with `curl` aren't affected.
+The macOS binaries aren't signed. If macOS blocks one you downloaded in a
+browser, run `xattr -d com.apple.quarantine ~/.local/bin/bicameral`.
 
-### 1. Build the binary
+**From source** (Go 1.27+):
 
 ```sh
-git clone <this repo> bicameral
+git clone https://github.com/tudalex/bicameral
 cd bicameral
-go build -o bicameral .
+go install .        # puts it in $(go env GOPATH)/bin
 ```
 
-This gives you a single `bicameral` executable in the repo. The plugin is
-embedded in it, so you don't need to install the plugin separately.
+The plugin is built into the binary, so there's nothing else to install.
 
-### 2. Put it on your `PATH` (optional)
+</details>
 
-Either install it into Go's bin directory:
+## Use it
 
-```sh
-go install .                     # installs to $(go env GOPATH)/bin/bicameral
-```
-
-and make sure that directory is on your `PATH`
-(`export PATH="$(go env GOPATH)/bin:$PATH"`), or copy the binary somewhere
-already on it:
-
-```sh
-cp bicameral ~/.local/bin/
-```
-
-### 3. Start your local model server
-
-Start Splash, Ollama or LM Studio (or several) and load or pull at least
-one chat model. For LM Studio, turn on the local server (Developer tab, or
-`lms server start`). Check that each one answers:
-
-```sh
-curl -s http://127.0.0.1:8010/v1/models    # Splash
-curl -s http://127.0.0.1:11434/v1/models   # Ollama
-curl -s http://127.0.0.1:1234/v1/models    # LM Studio
-```
-
-### 4. Check that routing works
-
-Run the proxy on its own and send it one request for a local model:
-
-```sh
-bicameral serve -listen 127.0.0.1:8787 &
-
-curl -s http://127.0.0.1:8787/v1/messages \
-  -H 'content-type: application/json' \
-  -H 'anthropic-version: 2023-06-01' \
-  -d '{"model":"claude-local-test","max_tokens":20,
-       "messages":[{"role":"user","content":"Say hi"}]}'
-
-kill %1
-```
-
-The response should name the local model in its `model` field, e.g.
-`"model":"incoai/Qwen3.8-27B-Splash"`, and the proxy should log a `local 200`
-line. No API key is needed for this test, because local requests never go to
-the cloud.
-
-## Running
-
-### Wrap Claude Code (the usual way)
-
-Run `bicameral` wherever you'd run `claude`, with the same arguments:
+Start your local model server, then run `bicameral` wherever you would run
+`claude`. Any arguments are passed straight through:
 
 ```sh
 cd ~/some/project
-bicameral                        # same as `claude`
-bicameral --continue             # any claude flags pass straight through
-bicameral -p "rename foo to bar in pkg/" # including headless mode
+bicameral                                  # same as `claude`
+bicameral --continue
+bicameral -p "rename foo to bar in pkg/"   # headless works too
 ```
 
-bicameral then:
+Claude delegates to the worker on its own when a job is mechanical. You can
+also ask directly: *"have the local worker run the tests and fix the
+failures"*.
 
-1. starts the proxy on a random `127.0.0.1` port;
-2. extracts the plugin to a temp dir;
-3. runs `claude --plugin-dir <dir> [your args...]` with `ANTHROPIC_BASE_URL`
-   pointing at the proxy;
-4. when Claude exits, stops the proxy, deletes the temp dir and exits with
-   Claude's exit code.
+**Good jobs for the worker:** edits you can describe exactly, renames,
+boilerplate, run-the-tests-and-fix loops, collecting files or command output.
 
-In the session you'll see the `local-worker` agent and the
-`bicameral:delegate-local` skill. Claude uses them by itself for mechanical
-work, or you can ask it directly ("have the local worker run the tests and
-fix the failures").
+**Claude keeps:** design decisions, unclear bugs, security-sensitive changes,
+and checking the worker's diff before reporting success.
 
-### Choosing the engine and model
+### Choosing the model
 
-Unless `BICAMERAL_LOCAL_URL` is set, bicameral checks Splash, Ollama and
-LM Studio on their default ports before launching Claude:
+On start, bicameral looks for Splash, Ollama and LM Studio. If it finds more
+than one, or an engine with several models, it asks you to pick:
 
-- If more than one is running, it asks which to use:
+```
+bicameral: Local engine:
+   1) Splash     http://127.0.0.1:8010  (1 model)
+   2) Ollama     http://127.0.0.1:11434  (15 models)
+Choose [1-2, default 1]:
+```
 
-  ```
-  bicameral: Local engine:
-     1) Splash     http://127.0.0.1:8010  (1 model)
-     2) Ollama     http://127.0.0.1:11434  (15 models)
-     3) LM Studio  http://127.0.0.1:1234  (5 models)
-  Choose [1-3, default 1]:
-  ```
-
-  If only one is running, it uses that one and prints its name.
-- Then it asks which of that engine's models to use. Embedding models are
-  left out. Set `BICAMERAL_LOCAL_MODEL` to skip this question.
-- Press Enter to accept the default (1). If stdin isn't a terminal (e.g. it's
-  piped), bicameral takes the first engine and model in the order above and
-  prints what it chose.
-- To skip detection completely, set `BICAMERAL_LOCAL_URL` (and usually
-  `BICAMERAL_LOCAL_MODEL`):
-
-  ```sh
-  BICAMERAL_LOCAL_URL=http://127.0.0.1:11434 BICAMERAL_LOCAL_MODEL=devstral:24b bicameral
-  ```
-
-If no engine is running, bicameral prints a warning and starts anyway. Only
-`local-worker` calls fail until an engine is up.
-
-### Watching the logs
-
-The terminal belongs to Claude's TUI, so proxy logs go to a file:
-`~/Library/Caches/bicameral/proxy.log` on macOS
-(`$XDG_CACHE_HOME/bicameral/proxy.log`, usually `~/.cache/...`, on Linux),
-or `BICAMERAL_LOG` if it's set. Follow it from another terminal to see what
-went where:
+Press Enter for the first option. To skip the questions, set the engine and
+model yourself:
 
 ```sh
-tail -f ~/Library/Caches/bicameral/proxy.log
+BICAMERAL_LOCAL_URL=http://127.0.0.1:11434 BICAMERAL_LOCAL_MODEL=devstral:24b bicameral
 ```
 
-```
-local 200   41.3s POST /v1/messages model=claude-local-qwen class=...
-cloud 200    3.2s POST /v1/messages model=claude-opus-5-5 class=...
-```
+If no engine is running, bicameral warns you and starts anyway. Only the
+worker fails until a model is up.
 
-Each line shows the route, status, latency, method, path, model and request
-class.
+### Seeing what went where
 
-### Run just the proxy
-
-To keep a long-running proxy, or to use it with another Anthropic client:
+Claude's interface takes over the terminal, so the proxy writes its log to a
+file. Watch it from another terminal:
 
 ```sh
-bicameral serve [-listen 127.0.0.1:8787] [-cloud URL] [-local URL] \
-                [-prefix claude-local] [-local-model NAME]
+tail -f ~/Library/Caches/bicameral/proxy.log     # macOS
+tail -f ~/.cache/bicameral/proxy.log             # Linux
 ```
 
-In this mode logs go to stderr. Point Claude Code at the proxy yourself and
-load the plugin from the repo:
-
-```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude --plugin-dir ./plugin
+```
+local 200   41.3s POST /v1/messages model=claude-local-qwen class=subagent
+cloud 200    3.2s POST /v1/messages model=claude-opus-5-5 class=main
 ```
 
-### Troubleshooting
-
-- **`starting claude: exec: "claude": executable file not found`**: Claude
-  Code isn't on your `PATH`.
-- **`warning: no local engine found`**: none of Splash, Ollama or LM Studio
-  answered on its default port with at least one model. Run the `curl`
-  commands from step 3. If your engine uses a different port, set
-  `BICAMERAL_LOCAL_URL`.
-- **`warning: local model not reachable`**: you set `BICAMERAL_LOCAL_URL`,
-  but nothing answers there, or `GET /v1/models` returns a 5xx.
-- **`local-worker` returns 404 or errors**: the engine probably doesn't
-  implement `/v1/messages`, or doesn't recognise the name in
-  `BICAMERAL_LOCAL_MODEL`. Check the `local` lines in the proxy log.
-- **Running bicameral from inside a bicameral session** (for example from a
-  Bash tool call): the inner proxy picks up the outer `ANTHROPIC_BASE_URL` as
-  its cloud upstream. That works, because the proxies chain, but the
-  `rest ->` address in the log will be a localhost port.
+`local` lines are the worker, `cloud` lines are Claude.
 
 ## Configuration
 
-| Variable                | Default                        | Meaning                                      |
-|-------------------------|--------------------------------|----------------------------------------------|
-| `BICAMERAL_LOCAL_URL`   | auto-detected (wrap) / `http://127.0.0.1:8010` (serve) | Local Anthropic-compatible upstream. Setting it turns off detection |
-| `BICAMERAL_LOCAL_MODEL` | picked from the engine (wrap) / `incoai/Qwen3.8-27B-Splash` (serve) | Model name sent to the local upstream |
-| `BICAMERAL_PREFIX`      | `claude-local`                 | Model prefix routed to the local upstream    |
-| `BICAMERAL_LOG`         | `<user cache dir>/bicameral/proxy.log` | Proxy log file (wrap mode only)      |
-| `ANTHROPIC_BASE_URL`    | `https://api.anthropic.com`    | Cloud upstream. If you already use a gateway, bicameral chains in front of it |
+| Variable                | Default                       | What it does |
+|-------------------------|-------------------------------|--------------|
+| `BICAMERAL_LOCAL_URL`   | auto-detected                 | Local model server. Setting it skips detection |
+| `BICAMERAL_LOCAL_MODEL` | asked on start                | Model name to use on that server |
+| `BICAMERAL_PREFIX`      | `claude-local`                | Model names starting with this go to the local server |
+| `BICAMERAL_LOG`         | `<cache dir>/bicameral/proxy.log` | Where the proxy log goes |
+| `ANTHROPIC_BASE_URL`    | `https://api.anthropic.com`   | Where Claude's requests go. If you already use a gateway, bicameral sits in front of it |
 
-In `serve` mode, the flags override the matching environment variables.
+### Running only the proxy
+
+`bicameral serve` runs the proxy without launching Claude, for a long-lived
+proxy or another Anthropic client. It listens on `127.0.0.1:8787` and logs to
+the terminal:
+
+```sh
+bicameral serve [-listen ADDR] [-local URL] [-local-model NAME] [-prefix P] [-cloud URL]
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude --plugin-dir ./plugin
+```
+
+In this mode `BICAMERAL_LOCAL_URL` defaults to Splash and
+`BICAMERAL_LOCAL_MODEL` to `incoai/Qwen3.8-27B-Splash`; the flags override
+both.
 
 ## The plugin
 
-`plugin/` is embedded at build time and loaded automatically in wrap mode.
+The `plugin/` folder is built into the binary and loaded for each session:
 
-- **`agents/local-worker.md`**: a subagent with `model: claude-local-qwen`, so
-  the proxy routes it to the local engine. It gets `Read`, `Edit`, `Write`,
-  `Bash`, `Glob` and `Grep`, and is told to stay in scope, verify its changes
+- **`agents/local-worker.md`**: the worker. It has `Read`, `Edit`, `Write`,
+  `Bash`, `Glob` and `Grep`, and is told to stay on task, check its changes,
   and stop after two failed attempts.
-- **`skills/delegate-local/SKILL.md`**: guidance for the main Claude session.
-  Delegate fully specified, mechanical work (targeted edits, renames,
-  test-fix loops, gathering output). Keep design, unclear bugs and
-  security-sensitive work for Claude. Always verify the worker's diff.
+- **`skills/delegate-local/SKILL.md`**: tells Claude what to delegate, how to
+  write the brief, and to verify the result.
 
-To route another agent to the local model, give it a `model:` that starts
-with the prefix (e.g. `claude-local-anything`).
+To send any other agent to the local model, give it a `model:` that starts
+with `claude-local` (for example `claude-local-reviewer`).
+
+## Limitations
+
+- **No Remote Control.** Claude Code turns off Remote Control (`claude rc`,
+  `--remote-control`) when `ANTHROPIC_BASE_URL` points anywhere but
+  api.anthropic.com, so bicameral sessions can't be driven from the phone or
+  claude.ai.
+- **Unofficial.** Anthropic doesn't support routing Claude Code to
+  non-Claude models. A Claude Code update can break this. Claude Code also
+  prints a harmless `unrecognized_model` warning for the worker.
+- **The first worker call is slow.** The local model has to read Claude
+  Code's instructions and tool list before its first answer. Later calls
+  reuse its cache and are much faster.
+
+## Troubleshooting
+
+- **`exec: "claude": executable file not found`**: Claude Code isn't on your
+  `PATH`.
+- **`warning: no local engine found`**: nothing answered on the default
+  ports. Check with `curl http://127.0.0.1:11434/v1/models` (or your
+  engine's port), or set `BICAMERAL_LOCAL_URL`.
+- **The worker returns 404 or errors**: the server doesn't support
+  `/v1/messages`, or doesn't know the model name. Look at the `local` lines
+  in the proxy log.
 
 ## License
 
