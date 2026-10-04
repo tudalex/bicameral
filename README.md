@@ -3,6 +3,10 @@
 Run Claude Code with two minds: Claude does the thinking, and a local model
 does the mechanical work.
 
+The name comes from Julian Jaynes's theory of the *bicameral mind*, in which
+one half of the brain issues instructions and the other carries them out.
+Here, Claude gives the instructions and the local model follows them.
+
 bicameral is a small HTTP proxy that sits between Claude Code and the API. It
 sends requests for opted-in subagents (any model starting with `claude-local`)
 to a local Anthropic-compatible engine. Everything else goes to the cloud
@@ -39,6 +43,22 @@ so your Anthropic credentials never reach the local engine.
   OpenAI-only server (`/v1/chat/completions`) won't work.
 
 ## Installation
+
+### Prebuilt binaries
+
+Tagged versions are published on the
+[releases page](https://github.com/tudalex/bicameral/releases) for macOS and
+Linux (amd64 and arm64). If you use one, skip steps 1–2 and go to step 3:
+
+```sh
+# pick darwin_arm64, darwin_amd64, linux_amd64 or linux_arm64
+curl -L https://github.com/tudalex/bicameral/releases/latest/download/bicameral_darwin_arm64.tar.gz | tar xz
+mv bicameral_darwin_arm64/bicameral ~/.local/bin/
+```
+
+The macOS binaries aren't signed. If macOS blocks a binary you downloaded
+with a browser, run `xattr -d com.apple.quarantine ~/.local/bin/bicameral`.
+Downloads with `curl` aren't affected.
 
 ### 1. Build the binary
 
