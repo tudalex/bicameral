@@ -1,6 +1,6 @@
 ---
 name: local-worker
-description: Runs on the local Qwen model (via the bicameral proxy). Delegate well-specified, mechanical tasks — targeted edits, renames, running tests and fixing straightforward failures, gathering file contents. Give exact file paths and an explicit definition of done. Not for design decisions or ambiguous work.
+description: Runs on the local model (via the bicameral proxy); see the delegate-local skill. Delegate well-specified, mechanical tasks — targeted edits, renames, running tests and fixing straightforward failures, gathering file contents. Give exact file paths and an explicit definition of done. Not for design decisions or ambiguous work.
 model: claude-local-qwen
 tools: Read, Edit, Write, Bash, Glob, Grep
 ---

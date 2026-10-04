@@ -1,101 +1,168 @@
-// bicameral is an ANTHROPIC_BASE_URL proxy for Claude Code. Requests whose
-// model starts with the local prefix (default "claude-local") go to a local
-// Anthropic-compatible engine (Splash); everything else passes through to
-// api.anthropic.com untouched.
+// bicameral runs Claude Code behind a proxy that sends opted-in subagents
+// (model "claude-local*") to a local Anthropic-compatible engine (Splash)
+// while everything else passes through to the cloud.
+//
+//	bicameral [claude args...]   start a proxy on a random port, run claude
+//	                             against it with the bicameral plugin loaded,
+//	                             and stop the proxy when claude exits
+//	bicameral serve [flags]      run just the proxy
+//
+// Configuration comes from the environment: BICAMERAL_LOCAL_URL,
+// BICAMERAL_LOCAL_MODEL, BICAMERAL_PREFIX, BICAMERAL_LOG. The cloud upstream
+// is an existing ANTHROPIC_BASE_URL if set, else api.anthropic.com. Without
+// BICAMERAL_LOCAL_URL, the wrapper detects running local engines (Splash,
+// Ollama, LM Studio) and asks which one, and which model, to use.
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"embed"
+	"errors"
 	"flag"
-	"io"
+	"fmt"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"strings"
-	"time"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 )
 
-var (
-	listen      = flag.String("listen", "127.0.0.1:8787", "listen address")
-	cloudURL    = flag.String("cloud", "https://api.anthropic.com", "cloud upstream")
-	localURL    = flag.String("local", "http://127.0.0.1:8010", "local Anthropic-compatible upstream")
-	localPrefix = flag.String("prefix", "claude-local", "model prefix routed to the local upstream")
-	localModel  = flag.String("local-model", "incoai/Qwen3.8-27B-Splash", "model name sent to the local upstream")
-)
+//go:embed all:plugin
+var pluginFS embed.FS
 
-// Headers that must never reach the local engine.
-var credentialHeaders = []string{"Authorization", "X-Api-Key", "Cookie"}
-
-func proxy(target string) *httputil.ReverseProxy {
-	u, err := url.Parse(target)
-	if err != nil {
-		log.Fatal(err)
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(u)
-			r.Out.Host = u.Host
-		},
-		FlushInterval: -1, // stream SSE immediately
-	}
+	return def
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (s *statusRecorder) WriteHeader(code int) { s.status = code; s.ResponseWriter.WriteHeader(code) }
-func (s *statusRecorder) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+func configFromEnv() config {
+	return config{
+		cloudURL:    env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+		localURL:    env("BICAMERAL_LOCAL_URL", "http://127.0.0.1:8010"),
+		localPrefix: env("BICAMERAL_PREFIX", "claude-local"),
+		localModel:  env("BICAMERAL_LOCAL_MODEL", "incoai/Qwen3.8-27B-Splash"),
 	}
 }
 
 func main() {
-	flag.Parse()
-	cloud, local := proxy(*cloudURL), proxy(*localURL)
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		serve(os.Args[2:])
+		return
+	}
+	os.Exit(wrap(os.Args[1:]))
+}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
-		route, model := "cloud", ""
+func serve(args []string) {
+	cfg := configFromEnv()
+	fl := flag.NewFlagSet("serve", flag.ExitOnError)
+	listen := fl.String("listen", "127.0.0.1:8787", "listen address")
+	fl.StringVar(&cfg.cloudURL, "cloud", cfg.cloudURL, "cloud upstream")
+	fl.StringVar(&cfg.localURL, "local", cfg.localURL, "local Anthropic-compatible upstream")
+	fl.StringVar(&cfg.localPrefix, "prefix", cfg.localPrefix, "model prefix routed to the local upstream")
+	fl.StringVar(&cfg.localModel, "local-model", cfg.localModel, "model name sent to the local upstream")
+	fl.Parse(args)
 
-		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/messages") {
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
+	log.Printf("bicameral on %s: %s* -> %s (%s), rest -> %s",
+		*listen, cfg.localPrefix, cfg.localURL, cfg.localModel, cfg.cloudURL)
+	log.Fatal(http.ListenAndServe(*listen, newHandler(cfg)))
+}
+
+// wrap runs claude against a private proxy and returns claude's exit code.
+func wrap(args []string) int {
+	cfg := configFromEnv()
+	chooseLocal(&cfg)
+
+	// The TUI owns the terminal, so proxy logs go to a file.
+	logPath := os.Getenv("BICAMERAL_LOG")
+	if logPath == "" {
+		dir, _ := os.UserCacheDir()
+		logPath = filepath.Join(dir, "bicameral", "proxy.log")
+	}
+	os.MkdirAll(filepath.Dir(logPath), 0o755)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bicameral:", err)
+		return 1
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bicameral:", err)
+		return 1
+	}
+	srv := &http.Server{Handler: newHandler(cfg)}
+	go srv.Serve(ln)
+	defer srv.Close()
+	baseURL := "http://" + ln.Addr().String()
+	log.Printf("bicameral on %s: %s* -> %s (%s), rest -> %s",
+		baseURL, cfg.localPrefix, cfg.localURL, cfg.localModel, cfg.cloudURL)
+
+	pluginDir, err := extractPlugin()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bicameral:", err)
+		return 1
+	}
+	defer os.RemoveAll(pluginDir)
+
+	cmd := exec.Command("claude", append([]string{"--plugin-dir", pluginDir}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = append(os.Environ(),
+		"ANTHROPIC_BASE_URL="+baseURL,
+		"CLAUDE_CODE_GATEWAY_HINT_HEADERS=1",
+	)
+
+	// claude shares our process group, so the terminal delivers ^C and
+	// friends to it directly; we just must not die first. Termination
+	// signals sent to us alone are forwarded.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigs)
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "bicameral: starting claude:", err)
+		return 1
+	}
+	go func() {
+		for s := range sigs {
+			if s == syscall.SIGTERM || s == syscall.SIGHUP {
+				cmd.Process.Signal(s)
 			}
-			var req map[string]json.RawMessage
-			if json.Unmarshal(body, &req) == nil {
-				json.Unmarshal(req["model"], &model)
-			}
-			if strings.HasPrefix(model, *localPrefix) {
-				route = "local"
-				req["model"], _ = json.Marshal(*localModel)
-				body, _ = json.Marshal(req)
-				for _, h := range credentialHeaders {
-					r.Header.Del(h)
-				}
-			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
-			r.Header.Del("Content-Length")
 		}
+	}()
 
-		if route == "local" {
-			local.ServeHTTP(rec, r)
-		} else {
-			cloud.ServeHTTP(rec, r)
+	err = cmd.Wait()
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &exitErr):
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal())
 		}
-		log.Printf("%-5s %3d %6.1fs %s %s model=%s class=%s",
-			route, rec.status, time.Since(start).Seconds(), r.Method, r.URL.Path, model,
-			r.Header.Get("X-Claude-Code-Request-Class"))
-	})
+		return exitErr.ExitCode()
+	default:
+		fmt.Fprintln(os.Stderr, "bicameral:", err)
+		return 1
+	}
+}
 
-	log.Printf("bicameral on %s: %s* -> %s (%s), rest -> %s", *listen, *localPrefix, *localURL, *localModel, *cloudURL)
-	log.Fatal(http.ListenAndServe(*listen, nil))
+// extractPlugin writes the embedded plugin to a temp dir for --plugin-dir.
+func extractPlugin() (string, error) {
+	dir, err := os.MkdirTemp("", "bicameral-plugin-")
+	if err != nil {
+		return "", err
+	}
+	sub, _ := fs.Sub(pluginFS, "plugin")
+	if err := os.CopyFS(dir, sub); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
 }

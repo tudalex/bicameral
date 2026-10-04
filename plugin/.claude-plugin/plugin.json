@@ -1,0 +1,5 @@
+{
+  "name": "bicameral",
+  "version": "0.1.0",
+  "description": "Delegate mechanical work to a local model running as a Claude Code subagent."
+}
