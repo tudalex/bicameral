@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p "dist/$NAME"
           go build -trimpath -ldflags "-s -w" -o "dist/$NAME/bicameral" .
-          cp README.md "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
 
       - uses: actions/upload-artifact@v4

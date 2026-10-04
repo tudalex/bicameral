@@ -48,7 +48,19 @@ so your Anthropic credentials never reach the local engine.
 
 Tagged versions are published on the
 [releases page](https://github.com/tudalex/bicameral/releases) for macOS and
-Linux (amd64 and arm64). If you use one, skip steps 1–2 and go to step 3:
+Linux (amd64 and arm64). To install the latest one:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tudalex/bicameral/master/install.sh | sh
+```
+
+The script detects your OS and CPU, downloads the matching tarball, checks it
+against the release's `checksums.txt`, and installs `bicameral` to
+`~/.local/bin`. Set `BICAMERAL_VERSION=v0.1.0` to install a specific release,
+or `BICAMERAL_INSTALL_DIR` to install somewhere else. After that, skip steps
+1–2 and go to step 3.
+
+To install by hand instead:
 
 ```sh
 # pick darwin_arm64, darwin_amd64, linux_amd64 or linux_arm64
@@ -259,3 +271,7 @@ In `serve` mode, the flags override the matching environment variables.
 
 To route another agent to the local model, give it a `model:` that starts
 with the prefix (e.g. `claude-local-anything`).
+
+## License
+
+[MIT](LICENSE)
